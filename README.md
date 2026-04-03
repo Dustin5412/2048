@@ -1,38 +1,193 @@
-# 2048
-A small clone of [1024](https://play.google.com/store/apps/details?id=com.veewo.a1024), based on [Saming's 2048](http://saming.fr/p/2048/) (also a clone). 2048 was indirectly inspired by [Threes](https://asherv.com/threes/).
+# Automated CI/CD Pipeline for Containerized 2048 Game
 
-Made just for fun. [Play it here!](http://gabrielecirulli.github.io/2048/)
+A fully automated CI/CD pipeline that builds, containerizes, and deploys the 2048 web game to AWS every time code is pushed to GitHub. No manual deployment steps required.
 
-The official app can also be found on the [Play Store](https://play.google.com/store/apps/details?id=com.gabrielecirulli.app2048) and [App Store!](https://itunes.apple.com/us/app/2048-by-gabriele-cirulli/id868076805)
+---
 
-### Contributions
+## Architecture
 
-[Anna Harren](https://github.com/iirelu/) and [sigod](https://github.com/sigod) are maintainers for this repository.
+```
+GitHub (source code)
+    │
+    │  push triggers
+    ▼
+AWS CodePipeline
+    │
+    ├──▶ Stage 1: Source
+    │         GitHub webhook detects push
+    │         Downloads latest code
+    │
+    ├──▶ Stage 2: Build (AWS CodeBuild)
+    │         Authenticates to Amazon ECR
+    │         Runs docker build
+    │         Tags and pushes image to ECR
+    │         Outputs imagedefinitions.json
+    │
+    └──▶ Stage 3: Deploy (Amazon ECS)
+              Reads imagedefinitions.json
+              Pulls new image from ECR
+              Starts new Fargate task
+              Drains and stops old task
+              Zero downtime rolling deploy
+```
 
-Other notable contributors:
+---
 
- - [TimPetricola](https://github.com/TimPetricola) added best score storage
- - [chrisprice](https://github.com/chrisprice) added custom code for swipe handling on mobile
- - [marcingajda](https://github.com/marcingajda) made swipes work on Windows Phone
- - [mgarciaisaia](https://github.com/mgarciaisaia) added support for Android 2.3
+## AWS Services Used
 
-Many thanks to [rayhaanj](https://github.com/rayhaanj), [Mechazawa](https://github.com/Mechazawa), [grant](https://github.com/grant), [remram44](https://github.com/remram44) and [ghoullier](https://github.com/ghoullier) for the many other good contributions.
+| Service | Role |
+|---|---|
+| **Amazon ECR** | Private Docker image registry — stores versioned container images |
+| **Amazon ECS (Fargate)** | Serverless container orchestration — runs the container without managing servers |
+| **AWS CodeBuild** | Managed build server — executes buildspec.yml to build and push Docker image |
+| **AWS CodePipeline** | Orchestrates the full pipeline — connects GitHub → CodeBuild → ECS |
+| **IAM** | Controls permissions between services — least privilege access |
 
-### Screenshot
+---
 
-<p align="center">
-  <img src="https://cloud.githubusercontent.com/assets/1175750/8614312/280e5dc2-26f1-11e5-9f1f-5891c3ca8b26.png" alt="Screenshot"/>
-</p>
+## How It Works
 
-That screenshot is fake, by the way. I never reached 2048 :smile:
+### 1. Dockerfile
+The 2048 game is a static HTML/CSS/JS app. It's served using nginx inside a Docker container built on Alpine Linux (~5MB base image).
 
-## Contributing
-Changes and improvements are more than welcome! Feel free to fork and open a pull request. Please make your changes in a specific branch and request to pull into `master`! If you can, please make sure the game fully works before sending the PR, as that will help speed up the process.
+```dockerfile
+FROM nginx:alpine
+COPY . /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+```
 
-You can find the same information in the [contributing guide.](https://github.com/gabrielecirulli/2048/blob/master/CONTRIBUTING.md)
+- `FROM nginx:alpine` — starts from a minimal Linux image with nginx pre-installed
+- `COPY` — moves game files into nginx's default serving directory
+- `EXPOSE 80` — documents that the container listens on HTTP port 80
+- `daemon off` — keeps nginx running as the main process so Docker doesn't exit
 
-## License
-2048 is licensed under the [MIT license.](https://github.com/gabrielecirulli/2048/blob/master/LICENSE.txt)
+### 2. buildspec.yml
+Tells CodeBuild exactly what to do during the build stage:
 
-## Donations
-I made this in my spare time, and it's hosted on GitHub (which means I don't have any hosting costs), but if you enjoyed the game and feel like buying me coffee, you can donate at my BTC address: `1Ec6onfsQmoP9kkL3zkpB6c5sA4PVcXU2i`. Thank you very much!
+```yaml
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin $REPOSITORY_URI
+  build:
+    commands:
+      - docker build -t $REPOSITORY_URI:latest .
+  post_build:
+    commands:
+      - docker push $REPOSITORY_URI:latest
+      - printf '[{"name":"2048-container","imageUri":"%s"}]' $REPOSITORY_URI:latest > imagedefinitions.json
+
+artifacts:
+  files:
+    - imagedefinitions.json
+```
+
+- `pre_build` — authenticates Docker to ECR using temporary AWS credentials
+- `build` — builds the Docker image from the Dockerfile
+- `post_build` — pushes image to ECR, generates `imagedefinitions.json` so CodePipeline knows which image to deploy
+
+### 3. ECS Fargate
+- **Cluster** — the environment that organizes compute capacity
+- **Task Definition** — blueprint specifying the container image, CPU (0.25 vCPU), memory (0.5GB), and port (80)
+- **Service** — keeps 1 task running at all times, handles rolling deployments
+
+### 4. CodePipeline
+Watches the GitHub repository for pushes and automatically runs the full pipeline:
+```
+push → Source → Build → Deploy → live update
+```
+
+---
+
+## IAM Permissions
+
+Two key roles are required:
+
+**CodeBuild Service Role**
+- `AmazonEC2ContainerRegistryPowerUser` — allows pushing images to ECR
+- `codeconnections:UseConnection` — allows accessing the GitHub connection
+
+**ECS Task Execution Role**
+- `AmazonECSTaskExecutionRolePolicy` — allows pulling images from ECR and writing logs to CloudWatch
+
+---
+
+## Local Development
+
+### Prerequisites
+- Docker Desktop
+- AWS CLI configured (`aws configure`)
+
+### Run Locally
+```bash
+# Clone the repo
+git clone https://github.com/Dustin5412/2048.git
+cd 2048
+
+# Build the Docker image
+docker build -t 2048-game .
+
+# Run the container
+docker run -p 8080:80 2048-game
+
+# Visit http://localhost:8080
+```
+
+### Push Image to ECR Manually
+```bash
+# Authenticate
+aws ecr get-login-password --region us-west-1 | docker login --username AWS --password-stdin YOUR_ECR_URI
+
+# Build, tag, push
+docker build -t 2048-game .
+docker tag 2048-game:latest YOUR_ECR_URI/2048-game:latest
+docker push YOUR_ECR_URI/2048-game:latest
+```
+
+---
+
+## Pipeline Screenshots
+
+> Add your screenshots here after completing the project:
+> - `screenshots/pipeline-success.png` — CodePipeline with all 3 stages green
+> - `screenshots/ecs-running.png` — ECS service showing 1/1 tasks running
+> - `screenshots/ecr-image.png` — ECR repository with latest image
+> - `screenshots/game-live.png` — 2048 game running at public IP
+
+---
+
+## Key Learnings
+
+**Docker layering** — Each Dockerfile instruction creates a cached layer. Unchanged layers are reused on rebuilds, making subsequent builds fast. Changing only game files only rebuilds the COPY layer.
+
+**IAM is the #1 failure point** — Most pipeline failures come from missing permissions. CodeBuild needs write access to ECR. ECS needs read access from ECR. These are separate roles with separate policies.
+
+**Fargate vs EC2** — Fargate is serverless — no EC2 instances to manage, patch, or scale. You define CPU/memory and AWS handles the rest. Ideal for learning and small workloads.
+
+**imagedefinitions.json** — The bridge between CodeBuild and ECS. CodeBuild outputs this file telling CodePipeline exactly which ECR image URI to deploy.
+
+**Port mapping** — The container listens on port 80 internally. When running locally, `-p 8080:80` maps your laptop's port 8080 to the container's port 80. In ECS, the security group opens port 80 directly.
+
+---
+
+## Cleanup
+
+To avoid AWS charges, delete resources in this order:
+1. CodePipeline → `2048-pipeline`
+2. CodeBuild → `2048-build`
+3. ECS Service → `2048-service`
+4. ECS Cluster → `2048-cluster`
+5. ECR Repository → `2048-game`
+6. IAM Roles created for this project
+
+---
+
+## Tech Stack
+
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat&logo=docker&logoColor=white)
+![AWS](https://img.shields.io/badge/AWS-232F3E?style=flat&logo=amazon-aws&logoColor=white)
+![nginx](https://img.shields.io/badge/nginx-009639?style=flat&logo=nginx&logoColor=white)
+![GitHub](https://img.shields.io/badge/GitHub-181717?style=flat&logo=github&logoColor=white)
